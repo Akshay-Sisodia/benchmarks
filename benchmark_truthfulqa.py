@@ -744,7 +744,6 @@ def run_benchmark(
     cpu_offload_gb: float = 0,
     dtype: Optional[str] = None,
     enforce_eager: bool = False,
-    prefill_chunk_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run TruthfulQA benchmark."""
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -800,8 +799,6 @@ def run_benchmark(
             else:
                 vllm_kwargs["dtype"] = dtype
             
-        if prefill_chunk_size is not None:
-            vllm_kwargs["prefill_chunk_size"] = prefill_chunk_size
             
         logger.info(f"Initializing model with parameters: {vllm_kwargs}")
         print(f"\nLoading model {model_id} with {dtype} precision...")
@@ -1365,7 +1362,6 @@ def main():
             dtype=dtype,
             enforce_eager=enforce_eager,
             batch_size=args.batch_size,
-            prefill_chunk_size=args.prefill_chunk_size,
         )
     except Exception as e:
         import traceback

@@ -540,7 +540,6 @@ def run_benchmark(
     dtype: Optional[str] = None,
     enforce_eager: Optional[bool] = None,
     batch_size: int = 8,
-    prefill_chunk_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run the benchmark on the GSM8K dataset using vLLM with few-shot prompting."""
     # Import vLLM only when needed
@@ -584,7 +583,6 @@ def run_benchmark(
         "tensor_parallel_size": tensor_parallel_size,
         "trust_remote_code": True,
         "seed": seed,
-        "block_size": 8,
         "dtype": dtype,
     }
 
@@ -601,18 +599,6 @@ def run_benchmark(
     if enforce_eager:
         model_kwargs["enforce_eager"] = True
         logger.info("Enforcing eager mode (CUDAGraph disabled)")
-
-    # Try to enable chunked prefill for better latency
-    try:
-        model_kwargs["enable_chunked_prefill"] = True
-        # Set custom prefill chunk size if provided
-        if prefill_chunk_size:
-            model_kwargs["prefill_chunk_size"] = prefill_chunk_size
-            logger.info(f"Chunked prefill enabled with chunk size {prefill_chunk_size}")
-        else:
-            logger.info("Chunked prefill enabled with default chunk size")
-    except Exception as e:
-        logger.warning(f"Advanced prefill options not supported: {e}")
 
     # Load the dataset
     logger.info("Loading GSM8K dataset")
@@ -692,7 +678,6 @@ def run_benchmark(
                 dtype=dtype,
                 enforce_eager=True,
                 batch_size=batch_size,
-                prefill_chunk_size=prefill_chunk_size,
             )
         # If BF16 fails, try FP16
         elif dtype == "bfloat16":
@@ -714,7 +699,6 @@ def run_benchmark(
                 dtype="float16",
                 enforce_eager=enforce_eager,
                 batch_size=batch_size,
-                prefill_chunk_size=prefill_chunk_size,
             )
         return {
             "error": str(e),
@@ -731,7 +715,6 @@ def run_benchmark(
                 "dtype": dtype,
                 "enforce_eager": enforce_eager,
                 "batch_size": batch_size,
-                "prefill_chunk_size": prefill_chunk_size,
             },
         }
 
@@ -774,7 +757,6 @@ def run_benchmark(
             "gpu_memory_utilization": gpu_memory_utilization,
             "tensor_parallel_size": tensor_parallel_size,
             "max_model_len": max_model_len,
-            "prefill_chunk_size": prefill_chunk_size,
         },
         "hardware_info": check_gpu_capabilities(),
         "timing": {
@@ -1334,7 +1316,6 @@ def main():
             dtype=dtype,
             enforce_eager=enforce_eager,
             batch_size=args.batch_size,
-            prefill_chunk_size=args.prefill_chunk_size,
         )
     except Exception as e:
         import traceback
