@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+#------------------------------------------------------------------------------
+# Standard Library Imports
+#------------------------------------------------------------------------------
 import argparse
 import json
 import logging
@@ -10,7 +14,22 @@ from typing import Dict, List, Optional, Tuple, Any
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import sys
+import io
+import re
+import subprocess
+
+#------------------------------------------------------------------------------
+# Third-Party Imports
+#------------------------------------------------------------------------------
+import numpy as np
+import torch
+from tqdm import tqdm
 import datasets
+
+#------------------------------------------------------------------------------
+# Environment Setup
+#------------------------------------------------------------------------------
 
 # Suppress warnings and configure environment variables upfront
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TensorFlow logging
@@ -19,61 +38,121 @@ os.environ["VLLM_DISABLE_TQDM"] = "1"  # Disable vLLM's tqdm
 warnings.filterwarnings("ignore", category=Warning)
 warnings.filterwarnings("ignore", message=".*GetPrototype.*")
 
-# Defer imports to improve startup time
-import numpy as np
-import torch
-import re
-import subprocess
-import io
-import sys
+#------------------------------------------------------------------------------
+# Constants
+#------------------------------------------------------------------------------
+
+# GPU model to compute capability mapping
+GPU_COMPUTE_MAP = {
+    # Volta
+    "V100": 7.0,
+    
+    # Pascal
+    "P100": 6.0,
+    "P40": 6.1,
+    "P4": 6.1,
+    
+    # Turing
+    "T4": 7.5,
+    "RTX 2080": 7.5,
+    "RTX 2070": 7.5,
+    "RTX 2060": 7.5,
+    
+    # Ampere
+    "A100": 8.0,
+    "A40": 8.6,
+    "A30": 8.0,
+    "A10": 8.6,
+    "A10G": 8.6,
+    "A6000": 8.6,
+    "RTX 3090": 8.6,
+    "RTX 3080": 8.6,
+    "RTX 3070": 8.6,
+    "RTX 3060": 8.6,
+    
+    # Pascal (older)
+    "GTX 1080": 6.1,
+    "GTX 1070": 6.1,
+    "GTX 1060": 6.1,
+    
+    # Hopper
+    "H100": 9.0,
+    
+    # Ada Lovelace
+    "L40": 8.9,
+    "L4": 8.9,
+    "RTX 4090": 8.9,
+    "RTX 4080": 8.9,
+    "RTX 4070": 8.9,
+    "RTX 4060": 8.9,
+}
 
 # Global lock for thread-safety
 nltk_lock = threading.RLock()
 nltk_initialized = False
 
+# Pre-compile regex patterns for extraction
+NUMBER_PATTERN = re.compile(r"[-+]?\d*\.\d+|[-+]?\d+")
+DOLLAR_PATTERN = re.compile(r"\$\s*([-+]?\d*\.\d+|[-+]?\d+)(?:[^\d]*)$")
+DOLLAR_NUMBERS_PATTERN = re.compile(r"\$\s*([-+]?\d*\.\d+|[-+]?\d+)")
+ANSWER_PHRASE_PATTERNS = [
+    re.compile(r"(?:answer|result|total|sum|cost)(?:\s+is)?\s*\$?\s*([-+]?\d*\.\d+|[-+]?\d+)"),
+    re.compile(r"(?:spend|pay|price|amount)(?:\s+of)?\s*\$?\s*([-+]?\d*\.\d+|[-+]?\d+)"),
+]
 
-# Setup NLTK data path and download required resources
+# New regex patterns based on LMSYS evaluation framework
+STRICT_MATCH_PATTERN = re.compile(r"#### (\-?[0-9\.\,]+)")
+FLEXIBLE_EXTRACT_PATTERN = re.compile(r"(-?[$0-9.,]{2,})|(-?[0-9]+)")
+
+#------------------------------------------------------------------------------
+# NLTK Setup and Management
+#------------------------------------------------------------------------------
+
 def setup_nltk(custom_data_dir=None):
-    """Setup NLTK data path and download required resources efficiently."""
+    """
+    Setup NLTK data path and download required resources efficiently.
+    
+    Args:
+        custom_data_dir (Optional[str]): Custom directory to store NLTK data
+        
+    Returns:
+        bool: True if setup was successful, False otherwise
+    """
     global nltk_initialized
-
+    
     with nltk_lock:
         if nltk_initialized:
             return True
-
+        
         # Import NLTK only when needed
         import nltk
-
+        
         # Create a directory for NLTK data
         nltk_data_dir = custom_data_dir or os.path.expanduser("~/nltk_data")
         os.makedirs(nltk_data_dir, exist_ok=True)
-
+        
         # Set NLTK data path
         if nltk_data_dir not in nltk.data.path:
             nltk.data.path.append(nltk_data_dir)
-
+        
         print(f"NLTK data directory set to: {nltk_data_dir}")
-
+        
         # Required resources
         resources = [
-            "punkt",
-            "wordnet",
-            "omw-1.4",
-            "averaged_perceptron_tagger",
-            "universal_tagset",
+            'punkt', 'wordnet', 'omw-1.4', 'averaged_perceptron_tagger',
+            'universal_tagset'
         ]
-
+        
         # Download resources in parallel
         success = True
         with ThreadPoolExecutor(max_workers=min(5, len(resources))) as executor:
             futures = {
                 executor.submit(
                     lambda r: nltk.download(r, download_dir=nltk_data_dir, quiet=True),
-                    resource,
-                ): resource
-                for resource in resources
+                    resource
+                ): resource for resource in resources
             }
-
+            
             for future in futures:
                 resource = futures[future]
                 try:
@@ -81,119 +160,83 @@ def setup_nltk(custom_data_dir=None):
                 except Exception as e:
                     print(f"Failed to download {resource}: {e}")
                     success = False
-
+        
         # Special handling for punkt_tab
         try:
-            nltk.download("punkt_tab", download_dir=nltk_data_dir, quiet=True)
+            nltk.download('punkt_tab', download_dir=nltk_data_dir, quiet=True)
         except Exception:
             # Create the punkt_tab directory structure manually
-            punkt_tab_dir = os.path.join(nltk_data_dir, "tokenizers", "punkt_tab")
-            english_dir = os.path.join(punkt_tab_dir, "english")
+            punkt_tab_dir = os.path.join(nltk_data_dir, 'tokenizers', 'punkt_tab')
+            english_dir = os.path.join(punkt_tab_dir, 'english')
             os.makedirs(english_dir, exist_ok=True)
-
+            
             # Create a minimal punkt_tab file if it doesn't exist
-            punkt_tab_file = os.path.join(english_dir, "punkt.tab")
+            punkt_tab_file = os.path.join(english_dir, 'punkt.tab')
             if not os.path.exists(punkt_tab_file):
                 try:
-                    with open(punkt_tab_file, "w") as f:
-                        f.write(
-                            ".\t.\tMr.\tMs.\tMrs.\tDr.\tProf.\tInc.\tCo.\tCorp.\tLtd.\tetc.\te.g.\ti.e.\tvs."
-                        )
+                    with open(punkt_tab_file, 'w') as f:
+                        f.write(".\t.\tMr.\tMs.\tMrs.\tDr.\tProf.\tInc.\tCo.\tCorp.\tLtd.\tetc.\te.g.\ti.e.\tvs.")
                 except Exception as write_err:
                     print(f"Failed to create punkt_tab file: {write_err}")
                     success = False
-
+        
         nltk_initialized = True
         return success
 
-
-# Lazy-loaded imports and setup
 def get_nltk():
-    """Lazy-load NLTK only when needed."""
+    """
+    Lazy-load NLTK only when needed.
+    
+    Returns:
+        nltk: The NLTK module, initialized if necessary
+    """
     import nltk
-
     if not nltk_initialized:
         setup_nltk()
     return nltk
 
-
 @lru_cache(maxsize=1)
 def get_rouge_scorer():
-    """Lazy-load rouge_scorer with caching."""
+    """
+    Lazy-load rouge_scorer with caching.
+    
+    Returns:
+        rouge_scorer.RougeScorer: Initialized ROUGE scorer
+    """
     from rouge_score import rouge_scorer
+    return rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
 
-    return rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+#------------------------------------------------------------------------------
+# Dataset Loading and Management
+#------------------------------------------------------------------------------
 
-
-# Set up logging
-def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
-    """Setup detailed logging for the benchmark run."""
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"benchmark_{run_id}.log")
-
-    logger = logging.getLogger("vllm_benchmark")
-    logger.setLevel(logging.DEBUG)
-
-    # Clear any existing handlers
-    if logger.handlers:
-        for handler in logger.handlers:
-            logger.removeHandler(handler)
-
-    # Set up file handler for all logs (DEBUG and above)
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.DEBUG)
-
-    # Set up console handler for important logs only (INFO and above)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-
-    # Create formatters - detailed for file, minimal for console
-    file_formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    console_formatter = logging.Formatter("%(levelname)s - %(message)s")
-
-    file_handler.setFormatter(file_formatter)
-    console_handler.setFormatter(console_formatter)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-
-    return logger
-
-
-# Load GSM8K dataset
 @lru_cache(maxsize=1)
 def load_gsm8k(split: str = "test") -> "datasets.Dataset":
-    """Load the GSM8K dataset with caching."""
-    import datasets
-
+    """
+    Load the GSM8K dataset with caching.
+    
+    Args:
+        split (str): Dataset split to load ('train', 'validation', or 'test')
+        
+    Returns:
+        datasets.Dataset: The loaded GSM8K dataset
+    """
     return datasets.load_dataset("gsm8k", "main")[split]
 
+#------------------------------------------------------------------------------
+# Answer Extraction and Processing
+#------------------------------------------------------------------------------
 
-# Pre-compile regex patterns for extraction
-NUMBER_PATTERN = re.compile(r"[-+]?\d*\.\d+|[-+]?\d+")
-DOLLAR_PATTERN = re.compile(r"\$\s*([-+]?\d*\.\d+|[-+]?\d+)(?:[^\d]*)$")
-DOLLAR_NUMBERS_PATTERN = re.compile(r"\$\s*([-+]?\d*\.\d+|[-+]?\d+)")
-ANSWER_PHRASE_PATTERNS = [
-    re.compile(
-        r"(?:answer|result|total|sum|cost)(?:\s+is)?\s*\$?\s*([-+]?\d*\.\d+|[-+]?\d+)"
-    ),
-    re.compile(
-        r"(?:spend|pay|price|amount)(?:\s+of)?\s*\$?\s*([-+]?\d*\.\d+|[-+]?\d+)"
-    ),
-]
-
-# New regex patterns based on LMSYS evaluation framework
-STRICT_MATCH_PATTERN = re.compile(r"#### (\-?[0-9\.\,]+)")
-FLEXIBLE_EXTRACT_PATTERN = re.compile(r"(-?[$0-9.,]{2,})|(-?[0-9]+)")
-
-
-# Extract answer from model response for GSM8K using strict matching (#### format)
 def extract_strict_answer(response: str) -> Optional[float]:
-    """Extract the numerical answer from the model's response for GSM8K problems using strict matching.
-
+    """
+    Extract the numerical answer from the model's response for GSM8K problems using strict matching.
     Looks for a pattern like '#### 123' and extracts the number.
+    
+    Args:
+        response (str): The model's response text
+        
+    Returns:
+        Optional[float]: The extracted number or None if no valid answer found
     """
     if not response or not response.strip():
         return None
@@ -210,12 +253,16 @@ def extract_strict_answer(response: str) -> Optional[float]:
 
     return None
 
-
-# Extract answer from model response for GSM8K using flexible extraction
 def extract_flexible_answer(response: str) -> Optional[float]:
-    """Extract the numerical answer from the model's response for GSM8K problems using flexible extraction.
-
+    """
+    Extract the numerical answer from the model's response for GSM8K problems using flexible extraction.
     Finds all numbers or dollar amounts in the text and takes the last one.
+    
+    Args:
+        response (str): The model's response text
+        
+    Returns:
+        Optional[float]: The extracted number or None if no valid answer found
     """
     if not response or not response.strip():
         return None
@@ -246,12 +293,16 @@ def extract_flexible_answer(response: str) -> Optional[float]:
         # Return None for any unexpected errors
         return None
 
-
-# Keep the original extract_answer for backward compatibility
 def extract_answer(response: str) -> Optional[float]:
-    """Extract the numerical answer from the model's response for GSM8K problems.
-
+    """
+    Extract the numerical answer from the model's response for GSM8K problems.
     First tries the strict pattern, then falls back to flexible extraction.
+    
+    Args:
+        response (str): The model's response text
+        
+    Returns:
+        Optional[float]: The extracted number or None if no valid answer found
     """
     try:
         # Try strict matching first
@@ -265,10 +316,17 @@ def extract_answer(response: str) -> Optional[float]:
         # Return None for any unexpected errors
         return None
 
-
 # Extract ground truth answer from GSM8K
 def extract_ground_truth(answer: str) -> Optional[float]:
-    """Extract the numerical answer from the ground truth for GSM8K problems."""
+    """
+    Extract the numerical answer from the ground truth for GSM8K problems.
+    
+    Args:
+        answer (str): The ground truth answer text
+        
+    Returns:
+        Optional[float]: The extracted number or None if no valid answer found
+    """
     if not answer:
         return None
 
@@ -283,7 +341,6 @@ def extract_ground_truth(answer: str) -> Optional[float]:
     except Exception:
         # Return None for any unexpected errors
         return None
-
 
 # Format five-shot multi-turn examples for GSM8K
 def format_five_shot_multiturn(
@@ -316,10 +373,24 @@ def format_five_shot_multiturn(
                 formatted_prompt += f"User: {user_msg}\nAssistant: {assistant_msg}\n\n"
         return formatted_prompt
 
-
 # Calculate BLEU, ROUGE, and METEOR scores
 def calculate_nlg_metrics(prediction: str, reference: str) -> Dict[str, float]:
-    """Calculate NLG metrics: BLEU, ROUGE, and METEOR with better performance."""
+    """
+    Calculate NLG metrics: BLEU, ROUGE, and METEOR with better performance.
+    
+    Args:
+        prediction (str): The model's predicted text
+        reference (str): The reference text to compare against
+        
+    Returns:
+        Dict[str, float]: Dictionary containing:
+            - bleu: BLEU score
+            - meteor: METEOR score
+            - rouge1_precision/recall/fmeasure: ROUGE-1 scores
+            - rouge2_precision/recall/fmeasure: ROUGE-2 scores
+            - rougeL_precision/recall/fmeasure: ROUGE-L scores
+            - error (optional): Error message if calculation failed
+    """
     # Skip metric calculation if input is too short
     if len(prediction.strip()) < 5 or len(reference.strip()) < 5:
         return {
@@ -409,40 +480,6 @@ def calculate_nlg_metrics(prediction: str, reference: str) -> Dict[str, float]:
         metrics["error"] = str(e)
         return metrics
 
-
-# GPU model to compute capability mapping
-GPU_COMPUTE_MAP = {
-    "V100": 7.0,  # Volta
-    "P100": 6.0,  # Pascal
-    "P40": 6.1,  # Pascal
-    "P4": 6.1,  # Pascal
-    "T4": 7.5,  # Turing
-    "A100": 8.0,  # Ampere
-    "A40": 8.6,  # Ampere
-    "A30": 8.0,  # Ampere
-    "A10": 8.6,  # Ampere
-    "A10G": 8.6,  # Ampere
-    "A6000": 8.6,  # Ampere
-    "RTX 3090": 8.6,  # Ampere
-    "RTX 3080": 8.6,  # Ampere
-    "RTX 3070": 8.6,  # Ampere
-    "RTX 3060": 8.6,  # Ampere
-    "RTX 2080": 7.5,  # Turing
-    "RTX 2070": 7.5,  # Turing
-    "RTX 2060": 7.5,  # Turing
-    "GTX 1080": 6.1,  # Pascal
-    "GTX 1070": 6.1,  # Pascal
-    "GTX 1060": 6.1,  # Pascal
-    "H100": 9.0,  # Hopper
-    "L40": 8.9,  # Ada Lovelace
-    "L4": 8.9,  # Ada Lovelace
-    "RTX 4090": 8.9,  # Ada Lovelace
-    "RTX 4080": 8.9,  # Ada Lovelace
-    "RTX 4070": 8.9,  # Ada Lovelace
-    "RTX 4060": 8.9,  # Ada Lovelace
-}
-
-
 @lru_cache(maxsize=1)
 def check_gpu_capabilities() -> Dict[str, Any]:
     """Check GPU capabilities including BFloat16 support and compute capability."""
@@ -520,7 +557,6 @@ def check_gpu_capabilities() -> Dict[str, Any]:
     capabilities["should_use_eager_attention"] = min_compute_capability < 8.0
 
     return capabilities
-
 
 # Run benchmark
 def run_benchmark(
@@ -1122,13 +1158,68 @@ def run_benchmark(
                 "run_config": results["run_config"],
             }
 
+#------------------------------------------------------------------------------
+# Logging Setup
+#------------------------------------------------------------------------------
+
+def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
+    """
+    Setup detailed logging for the benchmark run.
+    
+    Args:
+        log_dir (str): Directory to store log files
+        run_id (str): Unique identifier for this benchmark run
+        
+    Returns:
+        logging.Logger: Configured logger instance
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"benchmark_{run_id}.log")
+
+    logger = logging.getLogger("vllm_benchmark")
+    logger.setLevel(logging.DEBUG)
+
+    # Clear any existing handlers
+    if logger.handlers:
+        for handler in logger.handlers:
+            logger.removeHandler(handler)
+
+    # Set up file handler for all logs (DEBUG and above)
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+
+    # Set up console handler for important logs only (INFO and above)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+
+    # Create formatters - detailed for file, minimal for console
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+
+    file_handler.setFormatter(file_formatter)
+    console_handler.setFormatter(console_formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+#------------------------------------------------------------------------------
+# Command Line Interface
+#------------------------------------------------------------------------------
 
 def main():
-    """Main function to run the benchmark."""
+    """
+    Main function to run the GSM8K benchmark from command line.
+    
+    Returns:
+        int: Exit code (0 for success, 1 for failure)
+    """
     parser = argparse.ArgumentParser(
         description="Benchmark vLLM on GSM8K with few-shot prompting",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+
     # Required arguments
     parser.add_argument(
         "--model-id",
@@ -1152,7 +1243,10 @@ def main():
         help="Maximum number of tokens to generate",
     )
     model_group.add_argument(
-        "--temperature", type=float, default=0.0, help="Sampling temperature"
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature",
     )
     model_group.add_argument(
         "--max-model-len",
@@ -1232,28 +1326,47 @@ def main():
         help="Number of samples to benchmark (0 for all)",
     )
     bench_group.add_argument(
-        "--num-few-shot", type=int, default=5, help="Number of few-shot examples to use"
+        "--num-few-shot",
+        type=int,
+        default=5,
+        help="Number of few-shot examples to use",
     )
     bench_group.add_argument(
-        "--seed", type=int, default=42, help="Random seed for reproducibility"
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility",
     )
     bench_group.add_argument(
-        "--batch-size", type=int, default=8, help="Batch size for processing examples"
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Batch size for processing examples",
     )
 
     # Output configuration arguments
     output_group = parser.add_argument_group("Output Configuration")
     output_group.add_argument(
-        "--log-dir", type=str, default="logs", help="Directory to save logs"
+        "--log-dir",
+        type=str,
+        default="logs",
+        help="Directory to save logs",
     )
     output_group.add_argument(
-        "--output-dir", type=str, default="results", help="Directory to save results"
+        "--output-dir",
+        type=str,
+        default="results",
+        help="Directory to save results",
     )
     output_group.add_argument(
-        "--debug", action="store_true", help="Enable debug mode with additional logging"
+        "--debug",
+        action="store_true",
+        help="Enable debug mode with additional logging",
     )
     output_group.add_argument(
-        "--quiet", action="store_true", help="Reduce verbosity of output"
+        "--quiet",
+        action="store_true",
+        help="Reduce verbosity of output",
     )
     output_group.add_argument(
         "--nltk-data-dir",
@@ -1296,7 +1409,7 @@ def main():
 
     # Run the benchmark
     start_time = time.time()
-    print(f"Starting benchmark for model: {args.model_id}")
+    print(f"Starting GSM8K benchmark for model: {args.model_id}")
 
     try:
         results = run_benchmark(
@@ -1319,7 +1432,6 @@ def main():
         )
     except Exception as e:
         import traceback
-
         print(f"Benchmark failed with error: {e}")
         print(traceback.format_exc())
         return 1
@@ -1336,9 +1448,7 @@ def main():
         acc_metrics = results["metrics"]["answer_accuracy"]
         print(f"Total examples: {acc_metrics.get('total_examples', 0)}")
         print(f"Exact match accuracy: {acc_metrics.get('exact_match', 0.0):.4f}")
-        print(
-            f"Approximate match accuracy: {acc_metrics.get('approximate_match', 0.0):.4f}"
-        )
+        print(f"Approximate match accuracy: {acc_metrics.get('approximate_match', 0.0):.4f}")
         print(f"Overall accuracy: {acc_metrics.get('accuracy', 0.0):.4f}")
     else:
         print(f"Total examples: {results.get('total_examples', 0)}")
@@ -1359,6 +1469,9 @@ def main():
 
     return 0
 
+#------------------------------------------------------------------------------
+# Entry Point
+#------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     exit_code = main()

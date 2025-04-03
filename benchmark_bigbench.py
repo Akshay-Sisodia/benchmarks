@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+#------------------------------------------------------------------------------
+# Standard Library Imports
+#------------------------------------------------------------------------------
 import argparse
 import json
 import logging
@@ -13,14 +17,9 @@ import threading
 import random
 import uuid
 
-# Suppress warnings and configure environment variables upfront
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
-os.environ["VLLM_DISABLE_PROGRESS_BAR"] = "1"  # Disable vLLM's progress bar
-os.environ["VLLM_DISABLE_TQDM"] = "1"  # Disable vLLM's tqdm
-warnings.filterwarnings('ignore', category=Warning)
-warnings.filterwarnings('ignore', message='.*GetPrototype.*')
-
-# Defer imports to improve startup time
+#------------------------------------------------------------------------------
+# Third-Party Imports
+#------------------------------------------------------------------------------
 import numpy as np
 import torch
 import re
@@ -30,17 +29,90 @@ import sys
 import requests
 from tqdm import tqdm
 
-# Global lock for thread-safety
-thread_lock = threading.RLock()
+#------------------------------------------------------------------------------
+# Environment Setup
+#------------------------------------------------------------------------------
 
-# Task URLs
+# Suppress warnings and configure environment variables upfront
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
+os.environ["VLLM_DISABLE_PROGRESS_BAR"] = "1"  # Disable vLLM's progress bar
+os.environ["VLLM_DISABLE_TQDM"] = "1"  # Disable vLLM's tqdm
+warnings.filterwarnings('ignore', category=Warning)
+warnings.filterwarnings('ignore', message='.*GetPrototype.*')
+
+#------------------------------------------------------------------------------
+# Constants
+#------------------------------------------------------------------------------
+
+# Task URLs for BIG-bench tasks
 TASK_URLS = {
     "date_understanding": "https://raw.githubusercontent.com/google/BIG-bench/main/bigbench/benchmark_tasks/date_understanding/task.json",
     "sports_understanding": "https://raw.githubusercontent.com/google/BIG-bench/main/bigbench/benchmark_tasks/sports_understanding/task.json"
 }
 
+# GPU model to compute capability mapping
+GPU_COMPUTE_MAP = {
+    # Volta
+    "V100": 7.0,
+    
+    # Pascal
+    "P100": 6.0,
+    "P40": 6.1,
+    "P4": 6.1,
+    
+    # Turing
+    "T4": 7.5,
+    "RTX 2080": 7.5,
+    "RTX 2070": 7.5,
+    "RTX 2060": 7.5,
+    
+    # Ampere
+    "A100": 8.0,
+    "A40": 8.6,
+    "A30": 8.0,
+    "A10": 8.6,
+    "A10G": 8.6,
+    "A6000": 8.6,
+    "RTX 3090": 8.6,
+    "RTX 3080": 8.6,
+    "RTX 3070": 8.6,
+    "RTX 3060": 8.6,
+    
+    # Pascal (older)
+    "GTX 1080": 6.1,
+    "GTX 1070": 6.1,
+    "GTX 1060": 6.1,
+    
+    # Hopper
+    "H100": 9.0,
+    
+    # Ada Lovelace
+    "L40": 8.9,
+    "L4": 8.9,
+    "RTX 4090": 8.9,
+    "RTX 4080": 8.9,
+    "RTX 4070": 8.9,
+    "RTX 4060": 8.9,
+}
+
+# Global lock for thread-safety
+thread_lock = threading.RLock()
+
+#------------------------------------------------------------------------------
+# Logging Setup
+#------------------------------------------------------------------------------
+
 def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
-    """Setup detailed logging for the benchmark run."""
+    """
+    Setup detailed logging for the benchmark run.
+    
+    Args:
+        log_dir (str): Directory to store log files
+        run_id (str): Unique identifier for this benchmark run
+        
+    Returns:
+        logging.Logger: Configured logger instance
+    """
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"benchmark_{run_id}.log")
     
@@ -72,8 +144,24 @@ def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
     
     return logger
 
+#------------------------------------------------------------------------------
+# Task Loading and Management
+#------------------------------------------------------------------------------
+
 def download_task(task_name: str, cache_dir: str) -> Dict:
-    """Download and cache a BIG-bench task."""
+    """
+    Download and cache a BIG-bench task.
+    
+    Args:
+        task_name (str): Name of the task to download
+        cache_dir (str): Directory to cache downloaded tasks
+        
+    Returns:
+        Dict: The loaded task data
+        
+    Raises:
+        Exception: If download or caching fails
+    """
     os.makedirs(cache_dir, exist_ok=True)
     cache_file = os.path.join(cache_dir, f"{task_name}.json")
     
@@ -94,8 +182,28 @@ def download_task(task_name: str, cache_dir: str) -> Dict:
     
     return task_data
 
-def format_prompt(example: Dict, task_name: str, few_shot_examples: Optional[List[Dict]] = None, system_prompt: str = "") -> str:
-    """Format a prompt for the given task with optional few-shot examples."""
+#------------------------------------------------------------------------------
+# Prompt Formatting and Answer Processing
+#------------------------------------------------------------------------------
+
+def format_prompt(
+    example: Dict,
+    task_name: str,
+    few_shot_examples: Optional[List[Dict]] = None,
+    system_prompt: str = ""
+) -> str:
+    """
+    Format a prompt for the given task with optional few-shot examples.
+    
+    Args:
+        example (Dict): The example to format
+        task_name (str): Name of the task
+        few_shot_examples (Optional[List[Dict]]): List of few-shot examples to include
+        system_prompt (str): System prompt to prepend
+        
+    Returns:
+        str: Formatted prompt string
+    """
     prompt = system_prompt + "\n\n" if system_prompt else ""
     
     if task_name == "date_understanding":
@@ -125,7 +233,16 @@ def format_prompt(example: Dict, task_name: str, few_shot_examples: Optional[Lis
     return prompt
 
 def extract_answer(response: str, choices: List[str]) -> Optional[str]:
-    """Extract the answer from the model's response."""
+    """
+    Extract the answer from the model's response.
+    
+    Args:
+        response (str): The model's response text
+        choices (List[str]): List of possible answer choices
+        
+    Returns:
+        Optional[str]: The extracted answer or None if no valid answer found
+    """
     if not response or not isinstance(response, str):
         return None
     
@@ -152,8 +269,24 @@ def extract_answer(response: str, choices: List[str]) -> Optional[str]:
     
     return None
 
+#------------------------------------------------------------------------------
+# GPU and Hardware Management
+#------------------------------------------------------------------------------
+
 def check_gpu_capabilities() -> Dict[str, Any]:
-    """Check GPU capabilities including BFloat16 support and compute capability."""
+    """
+    Check GPU capabilities including BFloat16 support and compute capability.
+    
+    Returns:
+        Dict containing:
+        - has_cuda (bool): Whether CUDA is available
+        - has_bf16 (bool): Whether BFloat16 is supported
+        - num_gpus (int): Number of available GPUs
+        - cuda_version (str): CUDA version if available
+        - device_names (List[str]): Names of available GPU devices
+        - compute_capabilities (List[float]): Compute capabilities of GPUs
+        - should_use_eager_attention (bool): Whether to use eager attention mode
+    """
     capabilities = {
         "has_cuda": torch.cuda.is_available(),
         "has_bf16": False,
@@ -161,37 +294,70 @@ def check_gpu_capabilities() -> Dict[str, Any]:
         "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
         "device_names": [],
         "compute_capabilities": [],
-        "should_use_eager_attention": False
+        "should_use_eager_attention": False,
     }
-    
+
     if not capabilities["has_cuda"]:
         return capabilities
-        
+
     # Get device information
     for i in range(capabilities["num_gpus"]):
         device_name = torch.cuda.get_device_name(i)
         capabilities["device_names"].append(device_name)
-        
-        # Try to determine compute capability
+
+        # Get compute capability using nvidia-smi first
+        compute_capability = None
         try:
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-                capture_output=True, text=True, check=True
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=2
             )
             if result.stdout.strip():
-                compute_capability = float(result.stdout.strip().split('\n')[i])
-                capabilities["compute_capabilities"].append(compute_capability)
-                if compute_capability >= 8.0:
-                    capabilities["has_bf16"] = True
+                lines = result.stdout.strip().split('\n')
+                if i < len(lines):
+                    compute_capability = float(lines[i].strip())
         except:
-            # Default to conservative estimates if nvidia-smi fails
-            capabilities["compute_capabilities"].append(7.0)
-    
+            pass
+
+        # Fall back to name matching if nvidia-smi failed
+        if compute_capability is None:
+            for gpu_name, cc in GPU_COMPUTE_MAP.items():
+                if gpu_name in device_name:
+                    compute_capability = cc
+                    break
+
+            # Default if we couldn't determine
+            if compute_capability is None:
+                compute_capability = 7.0  # Conservative default
+
+        capabilities["compute_capabilities"].append(compute_capability)
+
+        # Check BF16 support (compute capability >= 8.0)
+        if compute_capability >= 8.0:
+            capabilities["has_bf16"] = True
+
+        # Alternative check: try to create a BF16 tensor
+        if not capabilities["has_bf16"]:
+            try:
+                with torch.cuda.device(i):
+                    test_tensor = torch.zeros(1, dtype=torch.bfloat16, device=f"cuda:{i}")
+                    del test_tensor  # Clean up
+                    capabilities["has_bf16"] = True
+            except:
+                pass
+
     # Determine if eager attention should be used
     min_compute_capability = min(capabilities["compute_capabilities"]) if capabilities["compute_capabilities"] else 0
     capabilities["should_use_eager_attention"] = min_compute_capability < 8.0
-    
+
     return capabilities
+
+#------------------------------------------------------------------------------
+# Benchmark Core Logic
+#------------------------------------------------------------------------------
 
 def run_benchmark(
     model_id: str,
@@ -212,7 +378,31 @@ def run_benchmark(
     enforce_eager: Optional[bool] = None,
     num_samples: int = 0,
 ) -> Dict[str, Any]:
-    """Run the benchmark on specified BIG-bench tasks."""
+    """
+    Run the benchmark on specified BIG-bench tasks.
+    
+    Args:
+        model_id (str): HuggingFace model ID or local path
+        task_names (List[str]): List of BIG-bench tasks to evaluate
+        system_prompt (str): System prompt for the model
+        num_few_shot (int): Number of few-shot examples to use
+        max_tokens (int): Maximum number of tokens to generate
+        temperature (float): Sampling temperature
+        seed (int): Random seed for reproducibility
+        log_dir (str): Directory for logs
+        output_dir (str): Directory for results
+        cache_dir (str): Directory for caching tasks
+        gpu_memory_utilization (float): GPU memory utilization (0-1)
+        max_model_len (Optional[int]): Maximum sequence length
+        tensor_parallel_size (int): Number of GPUs for tensor parallelism
+        batch_size (int): Batch size for processing
+        dtype (Optional[str]): Model dtype (float16, bfloat16, etc.)
+        enforce_eager (Optional[bool]): Whether to enforce eager execution
+        num_samples (int): Number of samples per task (0 for all)
+        
+    Returns:
+        Dict[str, Any]: Benchmark results and metrics
+    """
     # Import vLLM only when needed
     from vllm import LLM, SamplingParams
     
@@ -515,33 +705,152 @@ def run_benchmark(
 
     return summary
 
+#------------------------------------------------------------------------------
+# Command Line Interface
+#------------------------------------------------------------------------------
+
 def main():
-    """Main function to run the BIG-bench benchmark."""
-    parser = argparse.ArgumentParser(description="Run BIG-bench benchmark with vLLM")
-    parser.add_argument("--model-id", type=str, required=True, help="Hugging Face model ID or local path")
-    parser.add_argument("--tasks", type=str, nargs="+", choices=list(TASK_URLS.keys()), 
-                       default=list(TASK_URLS.keys()), help="Tasks to run (default: all tasks)")
-    parser.add_argument("--num-samples", type=int, default=0, help="Number of samples to evaluate (0 for all)")
-    parser.add_argument("--max-tokens", type=int, default=512, help="Maximum number of tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for inference")
-    parser.add_argument("--output-dir", type=str, default="results", help="Directory to save results")
-    parser.add_argument("--log-dir", type=str, default="logs", help="Directory to save logs")
-    parser.add_argument("--cache-dir", type=str, default="task_cache", help="Directory to cache downloaded tasks")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization")
-    parser.add_argument("--max-model-len", type=int, help="Maximum sequence length for the model")
-    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="Number of GPUs for tensor parallelism")
-    parser.add_argument("--num-few-shot", type=int, default=5, help="Number of few-shot examples to use")
-    parser.add_argument("--dtype", type=str, choices=["float16", "bfloat16", "float32", "auto"],
-                       default="auto", help="Data type for model weights")
-    parser.add_argument("--enforce-eager", action="store_true", 
-                       help="Enforce eager mode (disable CUDA graph)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode with additional logging")
-    parser.add_argument("--quiet", action="store_true", help="Reduce verbosity of output")
-    parser.add_argument("--system-prompt", type=str, 
-                       default="You are a helpful AI assistant that answers questions accurately and truthfully.",
-                       help="System prompt to use for the model")
+    """
+    Main function to run the BIG-bench benchmark from command line.
+    
+    Returns:
+        int: Exit code (0 for success, 1 for failure)
+    """
+    parser = argparse.ArgumentParser(
+        description="Run BIG-bench benchmark with vLLM",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Required arguments
+    parser.add_argument(
+        "--model-id",
+        type=str,
+        required=True,
+        help="Hugging Face model ID or local path"
+    )
+    
+    # Task selection arguments
+    task_group = parser.add_argument_group("Task Selection")
+    task_group.add_argument(
+        "--tasks",
+        type=str,
+        nargs="+",
+        choices=list(TASK_URLS.keys()),
+        default=list(TASK_URLS.keys()),
+        help="Tasks to run (default: all tasks)"
+    )
+    task_group.add_argument(
+        "--num-samples",
+        type=int,
+        default=0,
+        help="Number of samples to evaluate (0 for all)"
+    )
+    
+    # Model configuration arguments
+    model_group = parser.add_argument_group("Model Configuration")
+    model_group.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="Maximum number of tokens to generate"
+    )
+    model_group.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature"
+    )
+    model_group.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed"
+    )
+    model_group.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Batch size for inference"
+    )
+    
+    # Output configuration arguments
+    output_group = parser.add_argument_group("Output Configuration")
+    output_group.add_argument(
+        "--output-dir",
+        type=str,
+        default="results",
+        help="Directory to save results"
+    )
+    output_group.add_argument(
+        "--log-dir",
+        type=str,
+        default="logs",
+        help="Directory to save logs"
+    )
+    output_group.add_argument(
+        "--cache-dir",
+        type=str,
+        default="task_cache",
+        help="Directory to cache downloaded tasks"
+    )
+    
+    # Hardware utilization arguments
+    hw_group = parser.add_argument_group("Hardware Utilization")
+    hw_group.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory utilization"
+    )
+    hw_group.add_argument(
+        "--max-model-len",
+        type=int,
+        help="Maximum sequence length for the model"
+    )
+    hw_group.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs for tensor parallelism"
+    )
+    hw_group.add_argument(
+        "--num-few-shot",
+        type=int,
+        default=5,
+        help="Number of few-shot examples to use"
+    )
+    hw_group.add_argument(
+        "--dtype",
+        type=str,
+        choices=["float16", "bfloat16", "float32", "auto"],
+        default="auto",
+        help="Data type for model weights"
+    )
+    hw_group.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Enforce eager mode (disable CUDA graph)"
+    )
+    
+    # Debug and verbosity arguments
+    debug_group = parser.add_argument_group("Debug Configuration")
+    debug_group.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode with additional logging"
+    )
+    debug_group.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce verbosity of output"
+    )
+    debug_group.add_argument(
+        "--system-prompt",
+        type=str,
+        default="You are a helpful AI assistant that answers questions accurately and truthfully.",
+        help="System prompt to use for the model"
+    )
+    
     args = parser.parse_args()
 
     # Set environment variables based on args
@@ -614,11 +923,13 @@ def main():
             print(f"{task_name}:")
             print(f"  Accuracy: {metrics.get('accuracy', 0.0):.4f}")
             print(f"  Average Score: {metrics.get('average_score', 0.0):.4f}")
-            print(f"  Accuracy: {task_result['metrics']['accuracy']:.4f}")
-            print(f"  Average Score: {task_result['metrics']['average_score']:.4f}")
-            print(f"  Correct: {task_result['metrics']['correct']}/{task_result['metrics']['total']}")
+            print(f"  Correct: {metrics['correct']}/{metrics['total']}")
     
     return 0
+
+#------------------------------------------------------------------------------
+# Entry Point
+#------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     sys.exit(main()) 

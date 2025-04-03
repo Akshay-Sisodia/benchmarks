@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+
+# Standard library imports
 import argparse
 import json
 import logging
@@ -7,56 +9,93 @@ import sys
 import time
 import warnings
 from datetime import datetime
-from typing import Dict, List, Optional, Any
-import torch
-import requests
-from pathlib import Path
-import numpy as np
-import subprocess
 from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+import subprocess
+# Third-party imports
+import numpy as np
+import requests
+import torch
 from tqdm import tqdm
 
+#------------------------------------------------------------------------------
+# Environment Setup
+#------------------------------------------------------------------------------
+
 # Suppress warnings and configure environment variables upfront
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
 os.environ["VLLM_DISABLE_PROGRESS_BAR"] = "1"  # Disable vLLM's progress bar
 os.environ["VLLM_DISABLE_TQDM"] = "1"  # Disable vLLM's tqdm
 warnings.filterwarnings('ignore', category=Warning)
 
+#------------------------------------------------------------------------------
+# Constants
+#------------------------------------------------------------------------------
+
 # GPU model to compute capability mapping
 GPU_COMPUTE_MAP = {
-    "V100": 7.0,    # Volta
-    "P100": 6.0,    # Pascal
-    "P40": 6.1,     # Pascal
-    "P4": 6.1,      # Pascal
-    "T4": 7.5,      # Turing
-    "A100": 8.0,    # Ampere
-    "A40": 8.6,     # Ampere
-    "A30": 8.0,     # Ampere
-    "A10": 8.6,     # Ampere
-    "A10G": 8.6,    # Ampere
-    "A6000": 8.6,   # Ampere
-    "RTX 3090": 8.6,  # Ampere
-    "RTX 3080": 8.6,  # Ampere
-    "RTX 3070": 8.6,  # Ampere
-    "RTX 3060": 8.6,  # Ampere
-    "RTX 2080": 7.5,  # Turing
-    "RTX 2070": 7.5,  # Turing
-    "RTX 2060": 7.5,  # Turing
-    "GTX 1080": 6.1,  # Pascal
-    "GTX 1070": 6.1,  # Pascal
-    "GTX 1060": 6.1,  # Pascal
-    "H100": 9.0,     # Hopper
-    "L40": 8.9,      # Ada Lovelace
-    "L4": 8.9,       # Ada Lovelace
-    "RTX 4090": 8.9,  # Ada Lovelace
-    "RTX 4080": 8.9,  # Ada Lovelace
-    "RTX 4070": 8.9,  # Ada Lovelace
-    "RTX 4060": 8.9,  # Ada Lovelace
+    # Volta
+    "V100": 7.0,
+    
+    # Pascal
+    "P100": 6.0,
+    "P40": 6.1,
+    "P4": 6.1,
+    
+    # Turing
+    "T4": 7.5,
+    "RTX 2080": 7.5,
+    "RTX 2070": 7.5,
+    "RTX 2060": 7.5,
+    
+    # Ampere
+    "A100": 8.0,
+    "A40": 8.6,
+    "A30": 8.0,
+    "A10": 8.6,
+    "A10G": 8.6,
+    "A6000": 8.6,
+    "RTX 3090": 8.6,
+    "RTX 3080": 8.6,
+    "RTX 3070": 8.6,
+    "RTX 3060": 8.6,
+    
+    # Pascal (older)
+    "GTX 1080": 6.1,
+    "GTX 1070": 6.1,
+    "GTX 1060": 6.1,
+    
+    # Hopper
+    "H100": 9.0,
+    
+    # Ada Lovelace
+    "L40": 8.9,
+    "L4": 8.9,
+    "RTX 4090": 8.9,
+    "RTX 4080": 8.9,
+    "RTX 4070": 8.9,
+    "RTX 4060": 8.9,
 }
+
+#------------------------------------------------------------------------------
+# GPU and Hardware Utilities
+#------------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def check_gpu_capabilities() -> Dict[str, Any]:
-    """Check GPU capabilities including BFloat16 support and compute capability."""
+    """
+    Check GPU capabilities including BFloat16 support and compute capability.
+    
+    Returns:
+        Dict containing:
+        - has_cuda (bool): Whether CUDA is available
+        - has_bf16 (bool): Whether BFloat16 is supported
+        - num_gpus (int): Number of available GPUs
+        - cuda_version (str): CUDA version if available
+        - device_names (List[str]): Names of available GPU devices
+        - compute_capabilities (List[float]): Compute capabilities of GPUs
+        - should_use_eager_attention (bool): Whether to use eager attention mode
+    """
     capabilities = {
         "has_cuda": torch.cuda.is_available(),
         "has_bf16": False,
@@ -109,7 +148,6 @@ def check_gpu_capabilities() -> Dict[str, Any]:
         # Alternative check: try to create a BF16 tensor
         if not capabilities["has_bf16"]:
             try:
-                # Use a context manager to handle potential errors and cleanup
                 with torch.cuda.device(i):
                     test_tensor = torch.zeros(1, dtype=torch.bfloat16, device=f"cuda:{i}")
                     del test_tensor  # Clean up
@@ -123,8 +161,23 @@ def check_gpu_capabilities() -> Dict[str, Any]:
     
     return capabilities
 
+#------------------------------------------------------------------------------
+# Dataset Management
+#------------------------------------------------------------------------------
+
 def download_dataset(output_path: str = "data/coin_flip_4.json") -> str:
-    """Download the coin flip dataset from GitHub if it doesn't exist locally."""
+    """
+    Download the coin flip dataset from GitHub if it doesn't exist locally.
+    
+    Args:
+        output_path (str): Path where the dataset should be saved
+        
+    Returns:
+        str: Path to the downloaded dataset
+        
+    Raises:
+        Exception: If download fails
+    """
     if os.path.exists(output_path):
         return output_path
         
@@ -136,7 +189,7 @@ def download_dataset(output_path: str = "data/coin_flip_4.json") -> str:
     
     try:
         response = requests.get(url)
-        response.raise_for_status()  # Raise an exception for bad status codes
+        response.raise_for_status()
         
         # Save the file
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -149,8 +202,35 @@ def download_dataset(output_path: str = "data/coin_flip_4.json") -> str:
         print(f"Error downloading dataset: {e}")
         raise
 
+def load_coin_flip_dataset(file_path: str) -> List[Dict]:
+    """
+    Load the coin flip dataset from a JSON file.
+    
+    Args:
+        file_path (str): Path to the JSON dataset file
+        
+    Returns:
+        List[Dict]: List of examples from the dataset
+    """
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+    return data['examples']
+
+#------------------------------------------------------------------------------
+# Logging Setup
+#------------------------------------------------------------------------------
+
 def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
-    """Setup detailed logging for the benchmark run."""
+    """
+    Setup detailed logging for the benchmark run.
+    
+    Args:
+        log_dir (str): Directory to store log files
+        run_id (str): Unique identifier for this benchmark run
+        
+    Returns:
+        logging.Logger: Configured logger instance
+    """
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"benchmark_coin_flip_{run_id}.log")
     
@@ -182,14 +262,22 @@ def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
     
     return logger
 
-def load_coin_flip_dataset(file_path: str) -> List[Dict]:
-    """Load the coin flip dataset from a JSON file."""
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-    return data['examples']
+#------------------------------------------------------------------------------
+# Prompt Formatting and Answer Processing
+#------------------------------------------------------------------------------
 
 def format_few_shot_examples(examples: List[Dict], system_prompt: str, model: 'LLM') -> str:
-    """Format few-shot examples using the model's chat template."""
+    """
+    Format few-shot examples using the model's chat template.
+    
+    Args:
+        examples (List[Dict]): List of example Q&A pairs
+        system_prompt (str): System prompt to prepend
+        model (LLM): The vLLM model instance
+        
+    Returns:
+        str: Formatted prompt with few-shot examples
+    """
     # Create conversation messages
     conversation = [{"role": "system", "content": system_prompt}]
     
@@ -217,13 +305,25 @@ def format_few_shot_examples(examples: List[Dict], system_prompt: str, model: 'L
         return formatted_prompt
 
 def extract_answer(response: str) -> Optional[str]:
-    """Extract Yes/No answer from the model's response."""
+    """
+    Extract Yes/No answer from the model's response.
+    
+    Args:
+        response (str): The model's response text
+        
+    Returns:
+        Optional[str]: "Yes", "No", or None if no clear answer found
+    """
     response = response.strip().lower()
     if "yes" in response:
         return "Yes"
     elif "no" in response:
         return "No"
     return None
+
+#------------------------------------------------------------------------------
+# Benchmark Core Logic
+#------------------------------------------------------------------------------
 
 def run_benchmark(
     model_id: str,
@@ -244,7 +344,31 @@ def run_benchmark(
     enforce_eager: Optional[bool] = None,
     batch_size: int = 8,
 ) -> Dict[str, Any]:
-    """Run the benchmark on the coin flip dataset using vLLM."""
+    """
+    Run the benchmark on the coin flip dataset using vLLM.
+    
+    Args:
+        model_id (str): HuggingFace model ID or local path
+        dataset_path (str): Path to the coin flip dataset
+        system_prompt (str): System prompt for the model
+        num_samples (int): Number of samples to evaluate (0 for all)
+        num_few_shot (int): Number of few-shot examples to use
+        max_tokens (int): Maximum number of tokens to generate
+        temperature (float): Sampling temperature
+        seed (int): Random seed for reproducibility
+        log_dir (str): Directory for logs
+        output_dir (str): Directory for results
+        gpu_memory_utilization (float): GPU memory utilization (0-1)
+        max_model_len (Optional[int]): Maximum sequence length
+        tensor_parallel_size (int): Number of GPUs for tensor parallelism
+        cpu_offload_gb (float): Amount of memory to offload to CPU
+        dtype (Optional[str]): Model dtype (float16, bfloat16, etc.)
+        enforce_eager (Optional[bool]): Whether to enforce eager execution
+        batch_size (int): Batch size for processing
+        
+    Returns:
+        Dict[str, Any]: Benchmark results and metrics
+    """
     # Import vLLM only when needed
     from vllm import LLM, SamplingParams
     
@@ -546,8 +670,17 @@ def run_benchmark(
                 "run_config": results["run_config"]
             }
 
+#------------------------------------------------------------------------------
+# Command Line Interface
+#------------------------------------------------------------------------------
+
 def main():
-    """Main function to run the benchmark."""
+    """
+    Main function to run the benchmark from command line.
+    
+    Returns:
+        int: Exit code (0 for success, 1 for failure)
+    """
     parser = argparse.ArgumentParser(
         description="Benchmark vLLM on coin flip dataset with few-shot prompting",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -660,6 +793,10 @@ def main():
         print(f"Benchmark failed with error: {e}")
         print(traceback.format_exc())
         return 1
+
+#------------------------------------------------------------------------------
+# Entry Point
+#------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     exit_code = main()

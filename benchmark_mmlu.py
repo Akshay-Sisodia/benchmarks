@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+#------------------------------------------------------------------------------
+# Standard Library Imports
+#------------------------------------------------------------------------------
 import argparse
 import json
 import logging
@@ -6,20 +10,25 @@ import os
 import time
 import warnings
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
 from functools import lru_cache
+from typing import Dict, List, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 import threading
-import requests
+
+#------------------------------------------------------------------------------
+# Third-Party Imports
+#------------------------------------------------------------------------------
 import numpy as np
 import torch
 import re
 import subprocess
 import io
 import sys
-import zipfile
-from pathlib import Path
 import datasets
+
+#------------------------------------------------------------------------------
+# Environment Setup
+#------------------------------------------------------------------------------
 
 # Suppress warnings and configure environment variables upfront
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TensorFlow logging
@@ -28,76 +37,131 @@ os.environ["VLLM_DISABLE_TQDM"] = "1"  # Disable vLLM's tqdm
 warnings.filterwarnings("ignore", category=Warning)
 warnings.filterwarnings("ignore", message=".*GetPrototype.*")
 
-# Global lock for thread-safety
-thread_lock = threading.RLock()
+#------------------------------------------------------------------------------
+# Constants
+#------------------------------------------------------------------------------
 
 # MMLU Categories
 MMLU_CATEGORIES = [
+    # STEM
     "abstract_algebra",
-    "anatomy",
     "astronomy",
-    "business_ethics",
-    "clinical_knowledge",
     "college_biology",
     "college_chemistry",
     "college_computer_science",
     "college_mathematics",
-    "college_medicine",
     "college_physics",
     "computer_security",
     "conceptual_physics",
-    "econometrics",
     "electrical_engineering",
     "elementary_mathematics",
+    
+    # Humanities
     "formal_logic",
-    "global_facts",
-    "high_school_biology",
-    "high_school_chemistry",
-    "high_school_computer_science",
     "high_school_european_history",
+    "high_school_us_history",
+    "high_school_world_history",
+    "philosophy",
+    "world_religions",
+    
+    # Social Sciences
+    "econometrics",
     "high_school_geography",
     "high_school_government_and_politics",
     "high_school_macroeconomics",
-    "high_school_mathematics",
     "high_school_microeconomics",
-    "high_school_physics",
     "high_school_psychology",
-    "high_school_statistics",
-    "high_school_us_history",
-    "high_school_world_history",
-    "human_aging",
     "human_sexuality",
+    "professional_psychology",
+    "sociology",
+    
+    # Other Sciences
+    "anatomy",
+    "clinical_knowledge",
+    "college_medicine",
+    "human_aging",
+    "medical_genetics",
+    "professional_medicine",
+    "virology",
+    
+    # Business and Law
+    "business_ethics",
     "international_law",
     "jurisprudence",
-    "logical_fallacies",
-    "machine_learning",
     "management",
     "marketing",
-    "medical_genetics",
+    "professional_accounting",
+    "professional_law",
+    
+    # Miscellaneous
+    "global_facts",
+    "logical_fallacies",
+    "machine_learning",
     "miscellaneous",
     "moral_disputes",
     "moral_scenarios",
     "nutrition",
-    "philosophy",
     "prehistory",
-    "professional_accounting",
-    "professional_law",
-    "professional_medicine",
-    "professional_psychology",
     "public_relations",
     "security_studies",
-    "sociology",
     "us_foreign_policy",
-    "virology",
-    "world_religions",
 ]
 
 # Answer choices mapping
 ANSWER_MAPPING = {0: "A", 1: "B", 2: "C", 3: "D"}
 REVERSE_ANSWER_MAPPING = {"A": 0, "B": 1, "C": 2, "D": 3}
 
+# GPU model to compute capability mapping
+GPU_COMPUTE_MAP = {
+    # Volta
+    "V100": 7.0,
+    
+    # Pascal
+    "P100": 6.0,
+    "P40": 6.1,
+    "P4": 6.1,
+    
+    # Turing
+    "T4": 7.5,
+    "RTX 2080": 7.5,
+    "RTX 2070": 7.5,
+    "RTX 2060": 7.5,
+    
+    # Ampere
+    "A100": 8.0,
+    "A40": 8.6,
+    "A30": 8.0,
+    "A10": 8.6,
+    "A10G": 8.6,
+    "A6000": 8.6,
+    "RTX 3090": 8.6,
+    "RTX 3080": 8.6,
+    "RTX 3070": 8.6,
+    "RTX 3060": 8.6,
+    
+    # Pascal (older)
+    "GTX 1080": 6.1,
+    "GTX 1070": 6.1,
+    "GTX 1060": 6.1,
+    
+    # Hopper
+    "H100": 9.0,
+    
+    # Ada Lovelace
+    "L40": 8.9,
+    "L4": 8.9,
+    "RTX 4090": 8.9,
+    "RTX 4080": 8.9,
+    "RTX 4070": 8.9,
+    "RTX 4060": 8.9,
+}
 
+# Global lock for thread-safety
+thread_lock = threading.RLock()
+
+#------------------------------------------------------------------------------
 # Set up logging
+#------------------------------------------------------------------------------
 def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
     """Setup detailed logging for the benchmark run."""
     os.makedirs(log_dir, exist_ok=True)
@@ -128,16 +192,29 @@ def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
 
     return logger
 
+#------------------------------------------------------------------------------
+# Dataset Loading and Management
+#------------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def load_mmlu(category: str, split: str = "test") -> "datasets.Dataset":
-    """Load a specific category of the MMLU dataset with caching."""
+    """
+    Load a specific category of the MMLU dataset with caching.
+    
+    Args:
+        category (str): The MMLU category to load
+        split (str): Dataset split to load ('train', 'validation', or 'test')
+        
+    Returns:
+        datasets.Dataset: The loaded dataset
+        
+    Raises:
+        ValueError: If loading fails
+    """
     try:
         # Configure dataset loading for speed
         datasets.config.HF_DATASETS_OFFLINE = 0
-        datasets.config.IN_MEMORY_MAX_SIZE = (
-            0  # Disable size limit for in-memory datasets
-        )
+        datasets.config.IN_MEMORY_MAX_SIZE = 0  # Disable size limit for in-memory datasets
         datasets.config.DOWNLOADED_DATASETS_PATH = os.path.expanduser("~/.cache/mmlu")
 
         # Load the dataset with minimal verification and caching
@@ -156,11 +233,17 @@ def load_mmlu(category: str, split: str = "test") -> "datasets.Dataset":
         print(error_msg)
         raise ValueError(error_msg)
 
-
-def load_all_mmlu_categories(
-    categories: List[str], split: str = "test"
-) -> Dict[str, "datasets.Dataset"]:
-    """Load multiple MMLU categories in parallel using ThreadPoolExecutor."""
+def load_all_mmlu_categories(categories: List[str], split: str = "test") -> Dict[str, "datasets.Dataset"]:
+    """
+    Load multiple MMLU categories in parallel using ThreadPoolExecutor.
+    
+    Args:
+        categories (List[str]): List of MMLU categories to load
+        split (str): Dataset split to load ('train', 'validation', or 'test')
+        
+    Returns:
+        Dict[str, datasets.Dataset]: Dictionary mapping category names to loaded datasets
+    """
     datasets_dict = {}
     num_workers = min(16, len(categories))
 
@@ -183,10 +266,20 @@ def load_all_mmlu_categories(
 
     return datasets_dict
 
+#------------------------------------------------------------------------------
+# Answer Processing and Prompt Formatting
+#------------------------------------------------------------------------------
 
-# Extract answer from model response for MMLU
 def extract_answer(response: str) -> Optional[str]:
-    """Extract the letter answer (A, B, C, or D) from the model's response."""
+    """
+    Extract the letter answer (A, B, C, or D) from the model's response.
+    
+    Args:
+        response (str): The model's response text
+        
+    Returns:
+        Optional[str]: The extracted answer letter or None if no valid answer found
+    """
     if not response or not isinstance(response, str):
         return None
 
@@ -206,15 +299,24 @@ def extract_answer(response: str) -> Optional[str]:
 
     return None
 
-
-# Format few-shot examples for MMLU
 def format_mmlu_question(
     question: str,
     choices: List[str],
     include_answer: bool = False,
     answer: Optional[int] = None,
 ) -> str:
-    """Format an MMLU question with its choices."""
+    """
+    Format an MMLU question with its choices.
+    
+    Args:
+        question (str): The question text
+        choices (List[str]): List of answer choices
+        include_answer (bool): Whether to include the correct answer
+        answer (Optional[int]): Index of the correct answer
+        
+    Returns:
+        str: Formatted question string
+    """
     formatted_question = f"Question: {question}\n\n"
     for idx, choice in enumerate(choices):
         formatted_question += f"{ANSWER_MAPPING[idx]}. {choice}\n"
@@ -222,11 +324,18 @@ def format_mmlu_question(
         formatted_question += f"\nThe correct answer is: {ANSWER_MAPPING[answer]}"
     return formatted_question
 
-
-def format_few_shot_examples(
-    examples: List[Dict], system_prompt: str, model: "LLM"
-) -> str:
-    """Format examples as a conversation using the model's chat template."""
+def format_few_shot_examples(examples: List[Dict], system_prompt: str, model: "LLM") -> str:
+    """
+    Format examples as a conversation using the model's chat template.
+    
+    Args:
+        examples (List[Dict]): List of example Q&A pairs
+        system_prompt (str): System prompt to prepend
+        model (LLM): The vLLM model instance
+        
+    Returns:
+        str: Formatted prompt with few-shot examples
+    """
     conversation = [{"role": "system", "content": system_prompt}]
 
     for example in examples:
@@ -252,43 +361,25 @@ def format_few_shot_examples(
                 formatted_prompt += f"User: {user_msg}\nAssistant: {assistant_msg}\n\n"
         return formatted_prompt
 
-
-# GPU model to compute capability mapping
-GPU_COMPUTE_MAP = {
-    "V100": 7.0,
-    "P100": 6.0,
-    "P40": 6.1,
-    "P4": 6.1,
-    "T4": 7.5,
-    "A100": 8.0,
-    "A40": 8.6,
-    "A30": 8.0,
-    "A10": 8.6,
-    "A10G": 8.6,
-    "A6000": 8.6,
-    "RTX 3090": 8.6,
-    "RTX 3080": 8.6,
-    "RTX 3070": 8.6,
-    "RTX 3060": 8.6,
-    "RTX 2080": 7.5,
-    "RTX 2070": 7.5,
-    "RTX 2060": 7.5,
-    "GTX 1080": 6.1,
-    "GTX 1070": 6.1,
-    "GTX 1060": 6.1,
-    "H100": 9.0,
-    "L40": 8.9,
-    "L4": 8.9,
-    "RTX 4090": 8.9,
-    "RTX 4080": 8.9,
-    "RTX 4070": 8.9,
-    "RTX 4060": 8.9,
-}
-
+#------------------------------------------------------------------------------
+# GPU and Memory Management
+#------------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def check_gpu_capabilities() -> Dict[str, Any]:
-    """Check GPU capabilities including BFloat16 support and compute capability."""
+    """
+    Check GPU capabilities including BFloat16 support and compute capability.
+    
+    Returns:
+        Dict containing:
+        - has_cuda (bool): Whether CUDA is available
+        - has_bf16 (bool): Whether BFloat16 is supported
+        - num_gpus (int): Number of available GPUs
+        - cuda_version (str): CUDA version if available
+        - device_names (List[str]): Names of available GPU devices
+        - compute_capabilities (List[float]): Compute capabilities of GPUs
+        - should_use_eager_attention (bool): Whether to use eager attention mode
+    """
     capabilities = {
         "has_cuda": torch.cuda.is_available(),
         "has_bf16": False,
@@ -302,10 +393,12 @@ def check_gpu_capabilities() -> Dict[str, Any]:
     if not capabilities["has_cuda"]:
         return capabilities
 
+    # Get device information
     for i in range(capabilities["num_gpus"]):
         device_name = torch.cuda.get_device_name(i)
         capabilities["device_names"].append(device_name)
 
+        # Get compute capability using nvidia-smi first
         compute_capability = None
         try:
             result = subprocess.run(
@@ -322,77 +415,53 @@ def check_gpu_capabilities() -> Dict[str, Any]:
         except:
             pass
 
+        # Fall back to name matching if nvidia-smi failed
         if compute_capability is None:
             for gpu_name, cc in GPU_COMPUTE_MAP.items():
                 if gpu_name in device_name:
                     compute_capability = cc
                     break
+
+            # Default if we couldn't determine
             if compute_capability is None:
-                compute_capability = 7.0
+                compute_capability = 7.0  # Conservative default
 
         capabilities["compute_capabilities"].append(compute_capability)
 
+        # Check BF16 support (compute capability >= 8.0)
         if compute_capability >= 8.0:
             capabilities["has_bf16"] = True
 
+        # Alternative check: try to create a BF16 tensor
         if not capabilities["has_bf16"]:
             try:
                 with torch.cuda.device(i):
-                    test_tensor = torch.zeros(
-                        1, dtype=torch.bfloat16, device=f"cuda:{i}"
-                    )
-                    del test_tensor
+                    test_tensor = torch.zeros(1, dtype=torch.bfloat16, device=f"cuda:{i}")
+                    del test_tensor  # Clean up
                     capabilities["has_bf16"] = True
             except:
                 pass
 
-    capabilities["should_use_eager_attention"] = (
-        min(capabilities["compute_capabilities"]) < 8.0
-    )
+    # Determine if eager attention should be used
+    min_compute_capability = min(capabilities["compute_capabilities"]) if capabilities["compute_capabilities"] else 0
+    capabilities["should_use_eager_attention"] = min_compute_capability < 8.0
 
     return capabilities
 
-
-def process_batch(model, batch_data, sampling_params, few_shot_examples, system_prompt):
-    """Process a batch of examples efficiently."""
-    prompts = []
-    for category, example in batch_data:
-        question = format_mmlu_question(example["question"], example["choices"])
-        if hasattr(model, "tokenizer") and hasattr(
-            model.tokenizer, "apply_chat_template"
-        ):
-            conversation = [
-                {"role": "system", "content": system_prompt},
-                *[
-                    {
-                        "role": "user",
-                        "content": format_mmlu_question(ex["question"], ex["choices"]),
-                        "role": "assistant",
-                        "content": f"The answer is {ANSWER_MAPPING[ex['answer']]}.",
-                    }
-                    for ex in few_shot_examples
-                ],
-                {"role": "user", "content": question},
-            ]
-            prompt = model.tokenizer.apply_chat_template(
-                conversation, tokenize=False, add_generation_prompt=True
-            )
-        else:
-            prompt = (
-                format_few_shot_examples(few_shot_examples, system_prompt, model)
-                + f"User: {question}\nAssistant:"
-            )
-        prompts.append(prompt)
-
-    batch_start = time.time()
-    outputs = model.generate(prompts, sampling_params)
-    batch_time = time.time() - batch_start
-
-    return outputs, batch_time
-
-
-def optimize_memory_settings(gpu_capabilities, cpu_offload_gb):
-    """Optimize memory settings based on GPU capabilities."""
+def optimize_memory_settings(gpu_capabilities: Dict[str, Any], cpu_offload_gb: float) -> Dict[str, Any]:
+    """
+    Optimize memory settings based on GPU capabilities.
+    
+    Args:
+        gpu_capabilities (Dict[str, Any]): GPU capabilities from check_gpu_capabilities()
+        cpu_offload_gb (float): Amount of memory to offload to CPU in GB
+        
+    Returns:
+        Dict containing optimized settings:
+        - dtype (str): Optimal data type for the model
+        - gpu_memory_utilization (float): GPU memory utilization target
+        - enforce_eager (bool): Whether to enforce eager execution
+    """
     settings = {
         "dtype": "bfloat16" if gpu_capabilities["has_bf16"] else "float16",
         "gpu_memory_utilization": 1.0 if cpu_offload_gb > 0 else 0.9,
@@ -400,20 +469,93 @@ def optimize_memory_settings(gpu_capabilities, cpu_offload_gb):
     }
     return settings
 
+#------------------------------------------------------------------------------
+# Batch Processing
+#------------------------------------------------------------------------------
 
-def calculate_metrics(results, total_correct, total_processed, latencies):
-    """Calculate all metrics properly with error handling."""
+def process_batch(
+    model: "LLM",
+    batch_data: List[Tuple[str, Dict]],
+    sampling_params: "SamplingParams",
+    few_shot_examples: List[Dict],
+    system_prompt: str
+) -> Tuple[List["Output"], float]:
+    """
+    Process a batch of examples efficiently.
+    
+    Args:
+        model (LLM): The vLLM model instance
+        batch_data (List[Tuple[str, Dict]]): List of (category, example) pairs
+        sampling_params (SamplingParams): Sampling parameters for generation
+        few_shot_examples (List[Dict]): Few-shot examples to include
+        system_prompt (str): System prompt to prepend
+        
+    Returns:
+        Tuple containing:
+        - List[Output]: Model outputs for the batch
+        - float: Time taken for batch inference
+    """
+    # Prepare prompts for the batch
+    prompts = []
+    for category, example in batch_data:
+        question = format_mmlu_question(example["question"], example["choices"])
+        if hasattr(model, "tokenizer") and hasattr(model.tokenizer, "apply_chat_template"):
+            conversation = [{"role": "system", "content": system_prompt}]
+            
+            # Add few-shot examples
+            for fs_example in few_shot_examples:
+                conversation.append({"role": "user", "content": format_mmlu_question(fs_example["question"], fs_example["choices"])})
+                conversation.append({"role": "assistant", "content": f"The answer is {ANSWER_MAPPING[fs_example['answer']]}."})
+            
+            # Add current question
+            conversation.append({"role": "user", "content": question})
+            
+            prompt = model.tokenizer.apply_chat_template(
+                conversation,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        else:
+            prompt = format_few_shot_examples(few_shot_examples, system_prompt, model) + f"User: {question}\nAssistant:"
+        
+        prompts.append(prompt)
+    
+    # Get model responses
+    batch_start = time.time()
+    outputs = model.generate(prompts=prompts, sampling_params=sampling_params)
+    batch_time = time.time() - batch_start
+    
+    return outputs, batch_time
+
+#------------------------------------------------------------------------------
+# Metrics and Results Processing
+#------------------------------------------------------------------------------
+
+def calculate_metrics(
+    results: Dict[str, Any],
+    total_correct: int,
+    total_processed: int,
+    latencies: List[float]
+) -> Dict[str, Any]:
+    """
+    Calculate all metrics properly with error handling.
+    
+    Args:
+        results (Dict[str, Any]): Current results dictionary
+        total_correct (int): Total number of correct answers
+        total_processed (int): Total number of processed examples
+        latencies (List[float]): List of inference latencies
+        
+    Returns:
+        Dict[str, Any]: Updated results dictionary with calculated metrics
+    """
     try:
         # Overall metrics
-        results["metrics"]["overall"].update(
-            {
-                "total_correct": total_correct,
-                "total_examples": total_processed,
-                "accuracy": total_correct / total_processed
-                if total_processed > 0
-                else 0.0,
-            }
-        )
+        results["metrics"]["overall"].update({
+            "total_correct": total_correct,
+            "total_examples": total_processed,
+            "accuracy": total_correct / total_processed if total_processed > 0 else 0.0,
+        })
 
         # Per-category metrics
         for category in results["metrics"]["categories"]:
@@ -421,12 +563,10 @@ def calculate_metrics(results, total_correct, total_processed, latencies):
             total = cat_metrics["total_examples"]
             correct = cat_metrics["total_correct"]
 
-            cat_metrics.update(
-                {
-                    "accuracy": correct / total if total > 0 else 0.0,
-                    "error_rate": 1 - (correct / total) if total > 0 else 1.0,
-                }
-            )
+            cat_metrics.update({
+                "accuracy": correct / total if total > 0 else 0.0,
+                "error_rate": 1 - (correct / total) if total > 0 else 1.0,
+            })
 
             # Per-choice accuracy for this category
             for choice in ANSWER_MAPPING.values():
@@ -449,36 +589,26 @@ def calculate_metrics(results, total_correct, total_processed, latencies):
         # Performance metrics
         if latencies:
             latency_array = np.array(latencies)
-            results["performance"]["latency_stats"].update(
-                {
-                    "mean": float(np.mean(latency_array)),
-                    "std": float(np.std(latency_array)),
-                    "min": float(np.min(latency_array)),
-                    "max": float(np.max(latency_array)),
-                    "p50": float(np.percentile(latency_array, 50)),
-                    "p90": float(np.percentile(latency_array, 90)),
-                    "p95": float(np.percentile(latency_array, 95)),
-                    "p99": float(np.percentile(latency_array, 99)),
-                }
-            )
+            results["performance"]["latency_stats"].update({
+                "mean": float(np.mean(latency_array)),
+                "std": float(np.std(latency_array)),
+                "min": float(np.min(latency_array)),
+                "max": float(np.max(latency_array)),
+                "p50": float(np.percentile(latency_array, 50)),
+                "p90": float(np.percentile(latency_array, 90)),
+                "p95": float(np.percentile(latency_array, 95)),
+                "p99": float(np.percentile(latency_array, 99)),
+            })
 
         # Token throughput metrics
         total_time = results["performance"]["total_inference_time"]
         total_tokens = results["performance"]["total_tokens"]
 
-        results["performance"].update(
-            {
-                "tokens_per_second": total_tokens / total_time
-                if total_time > 0
-                else 0.0,
-                "average_tokens_per_example": total_tokens / total_processed
-                if total_processed > 0
-                else 0.0,
-                "average_latency_per_example": total_time / total_processed
-                if total_processed > 0
-                else 0.0,
-            }
-        )
+        results["performance"].update({
+            "tokens_per_second": total_tokens / total_time if total_time > 0 else 0.0,
+            "average_tokens_per_example": total_tokens / total_processed if total_processed > 0 else 0.0,
+            "average_latency_per_example": total_time / total_processed if total_processed > 0 else 0.0,
+        })
 
     except Exception as e:
         logger.error(f"Error calculating metrics: {str(e)}")
@@ -486,6 +616,9 @@ def calculate_metrics(results, total_correct, total_processed, latencies):
 
     return results
 
+#------------------------------------------------------------------------------
+# Benchmark Core Logic
+#------------------------------------------------------------------------------
 
 def run_benchmark(
     model_id: str,
@@ -510,7 +643,36 @@ def run_benchmark(
     disable_bestpath: bool = False,
     max_num_seqs: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Run the benchmark on the MMLU dataset using vLLM with few-shot prompting."""
+    """
+    Run the benchmark on the MMLU dataset using vLLM with few-shot prompting.
+    
+    Args:
+        model_id (str): HuggingFace model ID or local path
+        task_names (List[str]): List of MMLU tasks to evaluate
+        system_prompt (str): System prompt for the model
+        num_few_shot (int): Number of few-shot examples to use
+        max_tokens (int): Maximum number of tokens to generate
+        temperature (float): Sampling temperature
+        seed (int): Random seed for reproducibility
+        log_dir (str): Directory for logs
+        output_dir (str): Directory for results
+        cache_dir (str): Directory for caching tasks
+        gpu_memory_utilization (float): GPU memory utilization (0-1)
+        max_model_len (Optional[int]): Maximum sequence length
+        tensor_parallel_size (int): Number of GPUs for tensor parallelism
+        batch_size (int): Batch size for processing
+        dtype (Optional[str]): Model dtype (float16, bfloat16, etc.)
+        enforce_eager (Optional[bool]): Whether to enforce eager execution
+        num_samples (int): Number of samples per task (0 for all)
+        cpu_offload_gb (float): Amount of memory to offload to CPU
+        kv_cache_dtype (Optional[str]): KV cache dtype
+        disable_bestpath (bool): Whether to disable bestpath optimization
+        max_num_seqs (Optional[int]): Maximum number of concurrent sequences
+        
+    Returns:
+        Dict[str, Any]: Benchmark results and metrics
+    """
+    # Import vLLM only when needed
     from vllm import LLM, SamplingParams
 
     # Generate a unique run ID and setup logging
@@ -737,9 +899,17 @@ def run_benchmark(
 
     return results
 
+#------------------------------------------------------------------------------
+# Command Line Interface
+#------------------------------------------------------------------------------
 
 def main():
-    """Main function to run the MMLU benchmark."""
+    """
+    Main function to run the MMLU benchmark from command line.
+    
+    Returns:
+        int: Exit code (0 for success, 1 for failure)
+    """
     parser = argparse.ArgumentParser(
         description="Benchmark vLLM on MMLU with few-shot prompting",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -943,7 +1113,6 @@ def main():
         )
     except Exception as e:
         import traceback
-
         logger.error(f"Benchmark failed with error: {e}")
         logger.error(traceback.format_exc())
         return 1
@@ -1004,6 +1173,9 @@ def main():
 
     return 0
 
+#------------------------------------------------------------------------------
+# Entry Point
+#------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     exit_code = main()
