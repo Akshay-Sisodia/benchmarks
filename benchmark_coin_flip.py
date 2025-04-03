@@ -565,6 +565,8 @@ def main():
                         help="System prompt for the model")
     parser.add_argument("--max-tokens", type=int, default=128,
                         help="Maximum number of tokens to generate")
+    parser.add_argument("--max-model-len", type=int, default=None,
+                        help="Maximum sequence length for the model")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature")
     parser.add_argument("--dtype", type=str,
@@ -625,6 +627,7 @@ def main():
             tensor_parallel_size=args.tensor_parallel_size,
             enforce_eager=args.enforce_eager,
             batch_size=args.batch_size,
+            max_model_len=args.max_model_len,
         )
         
         # Print final summary
