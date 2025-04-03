@@ -16,6 +16,7 @@ import re
 import subprocess
 import random
 import uuid
+import datasets
 # Suppress warnings and configure environment variables upfront
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
 os.environ["VLLM_DISABLE_PROGRESS_BAR"] = "1"  # Disable vLLM's progress bar
@@ -209,13 +210,15 @@ CHOICE_PATTERN = re.compile(r"[A-Z][\)\.]\s*(.*)")
 # Logging Setup
 #------------------------------------------------------------------------------
 
-def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
+def setup_logging(log_dir: str, run_id: str, debug: bool = False, quiet: bool = False) -> logging.Logger:
     """
     Setup detailed logging for the benchmark run.
     
     Args:
         log_dir (str): Directory to store log files
         run_id (str): Unique identifier for this benchmark run
+        debug (bool): Whether to enable debug logging
+        quiet (bool): Whether to reduce logging output
         
     Returns:
         logging.Logger: Configured logger instance
@@ -225,7 +228,10 @@ def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
     log_file = os.path.join(log_dir, f"benchmark_{run_id}.log")
     
     logger = logging.getLogger("vllm_benchmark")
-    logger.setLevel(logging.DEBUG)
+    
+    # Set base logging level based on debug flag
+    base_level = logging.DEBUG if debug else logging.INFO
+    logger.setLevel(base_level)
     
     # Clear any existing handlers
     if logger.handlers:
@@ -234,11 +240,11 @@ def setup_logging(log_dir: str, run_id: str) -> logging.Logger:
     
     # Set up file handler for all logs (DEBUG and above)
     file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
     
     # Set up console handler for important logs only (INFO and above)
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.WARNING if quiet else logging.INFO)
     
     # Create formatters - detailed for file, minimal for console
     file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -805,8 +811,17 @@ def load_model(model_id: str,
     
     # Determine and validate dtype
     if dtype is None:
-        dtype = get_recommended_dtype()
-        logger.info(f"Using recommended dtype: {dtype}")
+        if torch.cuda.is_available():
+            capabilities = check_gpu_capabilities()
+            if capabilities["has_bf16"]:
+                dtype = "bfloat16"
+                logger.info("Using BFloat16 precision (GPU supports BF16)")
+            else:
+                dtype = "float16"
+                logger.info("Using Float16 precision (GPU does not support BF16)")
+        else:
+            dtype = "float32"
+            logger.info("Using Float32 precision (no GPU available)")
     
     if dtype == "bfloat16" and torch.cuda.is_available():
         capabilities = check_gpu_capabilities()
@@ -816,14 +831,14 @@ def load_model(model_id: str,
             logger.warning("BFloat16 not supported, falling back to float16")
             dtype = "float16"
     
-    # Configure model parameters
+    # Initialize model_kwargs with basic values
     model_kwargs = {
         "model": model_id,
-        "trust_remote_code": True,
-        "tensor_parallel_size": tensor_parallel_size,
         "gpu_memory_utilization": gpu_memory_utilization,
+        "tensor_parallel_size": tensor_parallel_size,
+        "trust_remote_code": True,
         "dtype": dtype,
-        "enforce_eager": enforce_eager
+        "enforce_eager": enforce_eager  
     }
     
     # Add optional parameters if specified
@@ -831,7 +846,9 @@ def load_model(model_id: str,
         model_kwargs["max_model_len"] = max_model_len
     
     if cpu_offload_gb > 0:
-        model_kwargs["cpu_offload"] = cpu_offload_gb
+        model_kwargs["cpu_offload"] = True
+        model_kwargs["offload_offsets"] = True
+        logger.info(f"Enabling CPU offloading with {cpu_offload_gb}GB threshold")
     
     try:
         # Initialize model
@@ -839,12 +856,25 @@ def load_model(model_id: str,
         for key, value in model_kwargs.items():
             logger.info(f"  {key}: {value}")
         
+        from vllm import LLM
         model = LLM(**model_kwargs)
         
-        # Verify model loaded successfully
-        logger.info("Model loaded successfully")
-        logger.info(f"Model max sequence length: {model.max_model_len}")
-        logger.info(f"Model dtype: {model.dtype}")
+        # Get model configuration
+        try:
+            # Try to get max_model_len from model config if available
+            config = model.get_model_config()
+            max_len = config.get("max_position_embeddings") or config.get("max_sequence_length") or 2048
+            logger.info(f"Model max sequence length: {max_len}")
+        except Exception:
+            logger.info("Could not determine exact model sequence length, using default")
+            max_len = 2048
+        
+        # Store model attributes
+        model.max_model_len = max_len
+        model.model_dtype = dtype
+        
+        logger.info(f"Model loaded successfully")
+        logger.info(f"Model dtype: {dtype}")
         
         return model
         
@@ -1027,12 +1057,15 @@ def run_benchmark(
     cpu_offload_gb: float = 0,
     dtype: Optional[str] = None,
     enforce_eager: bool = False,
+    logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """Run TruthfulQA benchmark."""
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Setup logging
-    logger = setup_logging(log_dir, run_id)
+    # Use existing logger or create a new one
+    if logger is None:
+        logger = setup_logging(log_dir, run_id)
+    
     logger.info(f"Starting benchmark run {run_id}")
     
     # Load dataset
@@ -1057,44 +1090,17 @@ def run_benchmark(
     model_load_start = time.time()
     try:
         # Initialize vLLM with all kwargs
-        vllm_kwargs = {
-            "model": model_id,
-            "trust_remote_code": True,
-            "tensor_parallel_size": tensor_parallel_size,
-            "gpu_memory_utilization": gpu_memory_utilization,
-            "enforce_eager": enforce_eager,
-        }
-        
-        if max_model_len is not None:
-            vllm_kwargs["max_model_len"] = max_model_len
-            
-        if dtype is not None:
-            if dtype == "bfloat16":
-                capabilities = check_gpu_capabilities()
-                min_compute_capability = min(capabilities["compute_capabilities"]) if capabilities["compute_capabilities"] else 0
-                if min_compute_capability < 8.0:
-                    gpu_names = ", ".join(capabilities["device_names"])
-                    logger.warning(f"BFloat16 is not supported on your GPU(s) ({gpu_names}) with compute capability {min_compute_capability}. Falling back to float16.")
-                    dtype = "float16"
-                    vllm_kwargs["dtype"] = "float16"
-                else:
-                    vllm_kwargs["dtype"] = dtype
-            else:
-                vllm_kwargs["dtype"] = dtype
-            
-            
-        logger.info(f"Initializing model with parameters: {vllm_kwargs}")
-        print(f"\nLoading model {model_id} with {dtype} precision...")
-        
-        # Create a loading spinner
-        with tqdm(total=1, desc="Loading model", bar_format="{desc}: {percentage:3.0f}%|{bar}| {elapsed} elapsed") as loading_bar:
-            model_load_start_time = time.time()
-            model = LLM(**vllm_kwargs)
-            model_load_time = time.time() - model_load_start_time
-            loading_bar.update(1)
-            
-        print(f"Model loaded in {model_load_time:.2f}s")
-        logger.info(f"Initialized model {model_id}")
+        model = load_model(
+            model_id=model_id,
+            dtype=dtype,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            tensor_parallel_size=tensor_parallel_size,
+            cpu_offload_gb=cpu_offload_gb,
+            enforce_eager=enforce_eager
+        )
+        model_load_time = time.time() - model_load_start
+        logger.info(f"Model loaded in {model_load_time:.2f}s")
     except Exception as e:
         logger.error(f"Failed to initialize model: {e}")
         if "bfloat16" in str(e).lower() and "compute capability" in str(e).lower():
@@ -1512,9 +1518,11 @@ def main():
     
     args = parser.parse_args()
     
-    # Set up logging
-    setup_logging(args.log_dir, args.debug, args.quiet)
-    logger = logging.getLogger(__name__)
+    # Generate a run ID
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Set up logging once
+    logger = setup_logging(args.log_dir or "logs", run_id, args.debug, args.quiet)
     
     try:
         # Record benchmark start time
@@ -1531,48 +1539,28 @@ def main():
         # Set up NLTK resources
         setup_nltk(args.cache_dir)
         
-        # Load dataset
-        dataset = load_truthfulqa("validation")
-        logger.info(f"Loaded {len(dataset)} examples from TruthfulQA dataset")
-        
-        # Determine dtype if not specified
-        if args.dtype is None:
-            args.dtype = get_recommended_dtype()
-            logger.info(f"Using recommended dtype: {args.dtype}")
-        
-        # Load model and record loading time
-        model_load_start = time.time()
-        model = load_model(args.model_id, args.dtype, args.gpu_memory_utilization,
-                         args.max_model_len, args.tensor_parallel_size)
-        model_load_time = time.time() - model_load_start
-        
-        # Run benchmark
+        # Run benchmark with the existing logger
         results = run_benchmark(
             model_id=args.model_id,
-            system_prompt=args.system_prompt,
-            num_samples=args.num_samples if args.num_samples > 0 else None,
+            batch_size=args.batch_size,
+            output_dir=args.output_dir,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
             seed=args.seed,
-            log_dir=args.log_dir,
-            output_dir=args.output_dir,
+            log_dir=args.log_dir or "logs",
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=args.max_model_len,
             tensor_parallel_size=args.tensor_parallel_size,
-            cpu_offload_gb=args.cpu_offload_gb,
             dtype=args.dtype,
-            enforce_eager=args.enforce_eager,
-            batch_size=args.batch_size,
+            logger=logger  # Pass the existing logger
         )
         
         # Create summary
         summary = create_summary_from_results(
             results=results,
-            run_id=str(uuid.uuid4()),
+            run_id=run_id,
             model_id=args.model_id,
-            model_load_time=model_load_time,
+            model_load_time=results.get("model_load_time", 0),
             benchmark_start_time=benchmark_start_time,
             parameters=vars(args)
         )
@@ -1591,7 +1579,7 @@ def main():
         logger.debug("Stack trace:", exc_info=True)
         summary = create_summary_from_results(
             results=[],
-            run_id=str(uuid.uuid4()),
+            run_id=run_id,
             model_id=args.model_id,
             model_load_time=0,
             benchmark_start_time=benchmark_start_time,
@@ -1599,6 +1587,20 @@ def main():
             error=str(e)
         )
         return summary
+    finally:
+        # Cleanup NCCL process groups
+        if torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception as e:
+                logger.warning(f"Error during process group cleanup: {e}")
+        
+        # Clean up CUDA cache
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:
+                logger.warning(f"Error during CUDA cache cleanup: {e}")
 
 if __name__ == "__main__":
     main() 
