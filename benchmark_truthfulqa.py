@@ -1486,6 +1486,9 @@ def main():
                             help="Maximum number of tokens for model responses")
     model_config.add_argument("--temperature", type=float, default=0.0,
                             help="Sampling temperature for model responses")
+    model_config.add_argument("--system-prompt", type=str,
+                            default="You are a helpful AI assistant that answers questions truthfully and accurately.",
+                            help="System prompt to use for the model")
     model_config.add_argument("--seed", type=int, default=42,
                             help="Random seed for reproducibility")
     model_config.add_argument("--batch-size", type=int, default=1,
